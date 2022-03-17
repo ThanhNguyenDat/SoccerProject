@@ -32,3 +32,7 @@ pandas
 # pycocotools>=2.0  # COCO mAP
 # albumentations>=1.0.3
 thop  # FLOPs computation
+
+# TensorRT ONNX export
+git+https://github.com/BlueMirrors/cvu
+vidsz

@@ -32,12 +32,30 @@ from utils.downloads import gsutil_getsize
 from utils.metrics import box_iou, fitness
 from utils.torch_utils import init_torch_seeds
 
+from utils.downloads import gsutil_getsize
+from utils.metrics import box_iou, fitness
+
 # Settings
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[1]  # YOLOv5 root directory
+NUM_THREADS = min(8, max(1, os.cpu_count() - 1))  # number of YOLOv5 multiprocessing threads
+VERBOSE = str(os.getenv('VERBOSE', True)).lower() == 'true'  # global verbose mode
+
 torch.set_printoptions(linewidth=320, precision=5, profile='long')
 np.set_printoptions(linewidth=320, formatter={'float_kind': '{:11.5g}'.format})  # format short g, %precision=5
 pd.options.display.max_columns = 10
 cv2.setNumThreads(0)  # prevent OpenCV from multithreading (incompatible with PyTorch DataLoader)
-os.environ['NUMEXPR_MAX_THREADS'] = str(min(os.cpu_count(), 8))  # NumExpr max threads
+os.environ['NUMEXPR_MAX_THREADS'] = str(NUM_THREADS)  # NumExpr max threads
+
+
+def is_kaggle():
+    # Is environment a Kaggle Notebook?
+    try:
+        assert os.environ.get('PWD') == '/kaggle/working'
+        assert os.environ.get('KAGGLE_URL_BASE') == 'https://www.kaggle.com'
+        return True
+    except AssertionError:
+        return False
 
 
 class Profile(contextlib.ContextDecorator):
@@ -68,6 +86,31 @@ class Timeout(contextlib.ContextDecorator):
         if self.suppress and exc_type is TimeoutError:  # Suppress TimeoutError
             return True
 
+def set_logging(name=None, verbose=VERBOSE):
+    # Sets level and returns logger
+    if is_kaggle():
+        for h in logging.root.handlers:
+            logging.root.removeHandler(h)  # remove all handlers associated with the root logger object
+    rank = int(os.getenv('RANK', -1))  # rank in world for Multi-GPU trainings
+    logging.basicConfig(format="%(message)s", level=logging.INFO if (verbose and rank in (-1, 0)) else logging.WARNING)
+    return logging.getLogger(name)
+
+
+LOGGER = set_logging(__name__)  # define globally (used in train.py, val.py, detect.py, etc.)
+
+
+class WorkingDirectory(contextlib.ContextDecorator):
+    # Usage: @WorkingDirectory(dir) decorator or 'with WorkingDirectory(dir):' context manager
+    def __init__(self, new_dir):
+        self.dir = new_dir  # new dir
+        self.cwd = Path.cwd().resolve()  # current dir
+
+    def __enter__(self):
+        os.chdir(self.dir)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        os.chdir(self.cwd)
+
 
 def try_except(func):
     # try-except function. Usage: @try_except decorator
@@ -90,12 +133,25 @@ def set_logging(rank=-1, verbose=True):
         format="%(message)s",
         level=logging.INFO if (verbose and rank in [-1, 0]) else logging.WARN)
 
+def print_args(name, opt):
+    # Print argparser arguments
+    LOGGER.info(colorstr(f'{name}: ') + ', '.join(f'{k}={v}' for k, v in vars(opt).items()))
+
+
 
 def init_seeds(seed=0):
-    # Initialize random number generator (RNG) seeds
+    # Initialize random number generator (RNG) seeds https://pytorch.org/docs/stable/notes/randomness.html
+    # cudnn seed 0 settings are slower and more reproducible, else faster and less reproducible
+    import torch.backends.cudnn as cudnn
     random.seed(seed)
     np.random.seed(seed)
-    init_torch_seeds(seed)
+    torch.manual_seed(seed)
+    cudnn.benchmark, cudnn.deterministic = (False, True) if seed == 0 else (True, False)
+
+
+def intersect_dicts(da, db, exclude=()):
+    # Dictionary intersection of matching keys and shapes, omitting 'exclude' keys, using da values
+    return {k: v for k, v in da.items() if k in db and not any(x in k for x in exclude) and v.shape == db[k].shape}
 
 
 def get_latest_run(search_dir='.'):
@@ -182,6 +238,35 @@ def check_online():
     except OSError:
         return False
 
+def is_chinese(s='人工智能'):
+    # Is string composed of any Chinese characters?
+    return re.search('[\u4e00-\u9fff]', s)
+
+
+def emojis(str=''):
+    # Return platform-dependent emoji-safe version of string
+    return str.encode().decode('ascii', 'ignore') if platform.system() == 'Windows' else str
+
+
+def file_size(path):
+    # Return file/dir size (MB)
+    path = Path(path)
+    if path.is_file():
+        return path.stat().st_size / 1E6
+    elif path.is_dir():
+        return sum(f.stat().st_size for f in path.glob('**/*') if f.is_file()) / 1E6
+    else:
+        return 0.0
+
+
+def check_online():
+    # Check internet connectivity
+    import socket
+    try:
+        socket.create_connection(("1.1.1.1", 443), 5)  # check host accessibility
+        return True
+    except OSError:
+        return False
 
 @try_except
 def check_git_status():
@@ -335,6 +420,11 @@ def check_dataset(data: Path) -> dict:
 
     return data
 
+def url2file(url):
+    # Convert URL to filename, i.e. https://url.com/file.txt?auth -> file.txt
+    url = str(Path(url)).replace(':/', '://')  # Pathlib turns :// -> :/
+    file = Path(urllib.parse.unquote(url)).name.split('?')[0]  # '%2F' to '/', split https://url.com/file.txt?auth
+    return file
 
 def download(url, dir='.', unzip=True, delete=True, curl=False, threads=1):
     # Multi-threaded file download and unzip function, used in config.yaml for autodownload
